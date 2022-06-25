@@ -1,0 +1,100 @@
+---
+- name: Prepare testapp environment
+  hosts: localhost
+  become: false
+  run_once: true
+
+  vars:
+    image_tags_map:
+      stage: latest
+      prod: stable
+    qbec_yaml:
+      apiVersion: qbec.io/v1alpha1
+      kind: App
+      metadata:
+        name: testapp
+      spec:
+        environments:
+          stage:
+            defaultNamespace: testapp-stage
+            server: "{{ k8s_cluster_url }}"
+          prod:
+            defaultNamespace: testapp-prod
+            server: "{{ k8s_cluster_url }}"
+        vars:
+          external:
+            - name: registry
+              default: "{{ container_registry }}"
+            - name: image_tag
+              default: "{{ image_tags_map[deploy_env] }}"
+            - name: build_ref
+              default: "{{ build_ref | default('unknown') }}"
+            - name: pic_url
+              default: "{{ picture_url }}"
+            - name: registry_auth
+              # fake auth data (base64-encoded minimal valid JSON). Real data will be provided via environment
+              default: eyJhdXRocyI6IG51bGx9
+              secret: true
+
+  tasks:
+    - name: Prepare testapp environment
+      delegate_to: localhost
+      block:
+        - name: Import KUBECONF file
+          ansible.builtin.set_fact:
+            kubeconf: "{{ lookup('file', 'admin-' + cluster_name + '.conf') | from_json }}"
+
+        - name: Set K8s cluster access URL
+          ansible.builtin.set_fact:
+            k8s_cluster_url: "{{ kubeconf.clusters[0].cluster.server }}"
+
+        - name: Create qbec.yaml config
+          ansible.builtin.copy:
+            dest: testapp/qbec/qbec.yaml
+            content: "{{ qbec_yaml | to_yaml }}"
+            mode: 0644
+
+        - name: Set auth payload (k8s_registry_agent SA)
+          ansible.builtin.set_fact:
+            auth_payload: "json_key:{{ k8s_registry_agent_key | b64decode }}"
+
+        - name: Set dockerconfigjson secret (k8s_registry_agent SA)
+          ansible.builtin.set_fact:
+            dockerconfigjson:
+              auths:
+                cr.yandex:
+                  auth: "{{ auth_payload | b64encode }}"
+
+        - name: Set image tags map
+          ansible.builtin.set_fact:
+            image_tags_map: "{{ image_tags_map }}"
+      tags:
+        - prepare
+        - validate
+        - deploy
+
+
+    - name: "Run qbec to validate testapp in '{{ deploy_env }}' environment"
+      delegate_to: localhost
+      ansible.builtin.command: "qbec validate {{ deploy_env }} --app-tag={{ build_ref }} --vm:ext-str registry_auth --yes"
+      args:
+        chdir: testapp/qbec
+      environment:
+        registry_auth: "{{ dockerconfigjson | to_json | b64encode }}"
+        KUBECONFIG: "{{ playbook_dir }}/admin-{{ cluster_name }}.conf"
+      changed_when: false
+      tags:
+        - validate
+
+    - name: "Run qbec to deploy testapp in '{{ deploy_env }}' environment"
+      delegate_to: localhost
+      ansible.builtin.command: "qbec apply {{ deploy_env }} --app-tag={{ build_ref }} --vm:ext-str registry_auth --yes"
+      args:
+        chdir: testapp/qbec
+      environment:
+        registry_auth: "{{ dockerconfigjson | to_json | b64encode }}"
+        KUBECONFIG: "{{ playbook_dir }}/admin-{{ cluster_name }}.conf"
+      register: qbec_output
+      changed_when: qbec_output.stdout | regex_search(' (created|updated|deleted):')
+      tags:
+        - deploy
